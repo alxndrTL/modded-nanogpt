@@ -34,10 +34,13 @@ Next up, I wanted to check the length extrapolation capabilities of a trained GP
 
 Quite impressive compared to the GPT baseline. Note that the overall shape of the curves don't match the figure 13 of the nGPT paper (the GPT perplexity is supposed to shoot up but here it kinds of levels off..)
 
-Notes about my experiments :
+Notes about my experiments / potential things to look upon :
 - the slowdown incurred by nGPT over GPT is only about 20%, as opposed to 80% reported in the paper. Note that I used the latest `2.5` version of pytorch.
 - I used the WSD LR scheduler, as opposed to cosine scheduler in the paper.
-- I used muP for both GPT and nGPT to fix the LR of `2**(-9)` thanks to a sweep at `n_embd=64`. I used it in a "non-invasive" way as I like to call it : at the desired width `n_embd=768` I fixed SP=muP. See [this](https://x.com/AlexandreTL2/status/1841056891801104472).
+- the behavior of "nGPT catching up and beating GPT during the cooldown" is a bit weird, maybe try to make the slowdown longer ? (proposed by @Grad62304977)
+
+
+I used muP for both GPT and nGPT to fix the LR of `2**(-9)` thanks to a sweep at `n_embd=64`. I used it in a "non-invasive" way as I like to call it : at the desired width `n_embd=768` I fixed SP=muP. See [this](https://x.com/AlexandreTL2/status/1841056891801104472).
 
 This is test sweep LR I have done with the GPT baseline to check for the correctness of my muP implementation :
 <div align="center">
