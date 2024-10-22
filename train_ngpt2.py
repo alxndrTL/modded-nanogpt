@@ -270,6 +270,8 @@ class GPT(nn.Module):
         ))
         self.transformer.wte.NORMALIZE = 1
 
+        self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=1/math.sqrt(config.n_embd))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # no need for self.lm_head.NORMALIZE = 1 as its tied to transformer.wte
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
@@ -285,12 +287,12 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.logits_scaler() * self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.logits_scaler() * self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             logits = logits.float() # use tf32/fp32 for logits
             loss = None
 
