@@ -5,6 +5,8 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
+import tyro
+import wandb
 from dataclasses import dataclass
 
 import numpy as np
@@ -183,16 +185,26 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+        d_ff = int((8/3) * config.n_embd)
+
+        # uv projection
+        self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc.WEIGHT_HIDDEN = 1
+        self.c_fc2.WEIGHT_HIDDEN = 1
+        # output projection
+        self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
+        self.c_proj.RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.WEIGHT_HIDDEN = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x1 = self.c_fc(x)
+        x2 = self.c_fc2(x)
+        x2 = F.silu(x2)
+        x = x1 * x2
         x = self.c_proj(x)
         return x
 
@@ -349,10 +361,12 @@ class Hyperparameters:
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
+    log_wandb : bool = True
+    log_wandb_every : int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
+args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -364,6 +378,9 @@ device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+if master_process and args.log_wandb:
+    wandb.init(project="modded_gpt", config={**vars(args)})
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -474,6 +491,8 @@ for step in range(args.num_iterations + 1):
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if args.log_wandb:
+                wandb.log({"val_loss": val_loss}, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -528,6 +547,8 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+        if args.log_wandb and (step % args.log_wandb_every == 0):
+            wandb.log({"train_loss": train_loss.item(), "lr": optimizers[0].param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
