@@ -181,6 +181,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v.NORMALIZE = 1
         # q,k scaling
         self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=1/math.sqrt(config.n_embd))
+        self.qk_scaler.ADAMW = 1
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.NORMALIZE = 1
@@ -217,6 +218,8 @@ class MLP(nn.Module):
 
         self.u_scaler = Scaler(dim=d_ff, init=1, scale=1)
         self.v_scaler = Scaler(dim=d_ff, init=1, scale=1)
+        self.u_scaler.ADAMW = 1
+        self.v_scaler.ADAMW = 1
 
         # output projection
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
@@ -237,9 +240,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.attn_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
+        self.attn_scaler.ADAMW = 1
 
         self.mlp = MLP(config)
         self.mlp_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
+        self.mlp_scaler.ADAMW = 1
 
     def forward(self, x):
         hA = F.normalize(self.attn(x), dim=-1)
@@ -271,8 +276,10 @@ class GPT(nn.Module):
         self.transformer.wte.NORMALIZE = 1
 
         self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=1/math.sqrt(config.n_embd))
+        self.logits_scaler.ADAMW = 1
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.ADAMW = 1
         # no need for self.lm_head.NORMALIZE = 1 as its tied to transformer.wte
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
@@ -396,9 +403,9 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 5100 # number of iterations to run
+    num_iterations : int = 4768 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -408,7 +415,7 @@ class Hyperparameters:
     log_wandb_every : int = 12
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 2000 # every how many steps to save the checkpoint? 0 for only at the end
 args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -445,8 +452,10 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=1, n_embd=64))
 model = model.cuda()
+if master_process:
+        print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -456,24 +465,40 @@ raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+params_adamw = []
+for module in raw_model.modules():    
+    if hasattr(module, 'ADAMW'):
+        if isinstance(module, nn.Linear): # lm_head
+            params_adamw.append(module.weight)
+        else: # scaler
+            params_adamw.append(module.scale)
+all_params = set(p for p in raw_model.parameters() if p.requires_grad)
+params_muon = list(all_params - set(params_adamw))
+optimizer1 = torch.optim.AdamW(params_adamw, lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
+optimizer2 = Muon(params_muon, lr=0.1*args.learning_rate, momentum=0.95,
                   rank=ddp_rank, world_size=ddp_world_size)
 optimizers = [optimizer1, optimizer2]
+if master_process:
+    num_params_adamw = sum(p.numel() for group in optimizer1.param_groups for p in group['params'])
+    num_params_muon = sum(p.numel() for group in optimizer2.param_groups for p in group['params'])
+    print(f"Number of parameters in AdamW: {num_params_adamw}")
+    print(f"Number of parameters in Muon: {num_params_muon}")
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
+    # linear warmup
     if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
+        return i/args.warmup_iters
+        
+    # constant lr after num_iters
+    if it > args.num_iterations:
+        return 0
+        
+    # in between, cosine decay
+    decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return coeff
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # begin logging
