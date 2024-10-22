@@ -166,8 +166,13 @@ class CausalSelfAttention(nn.Module):
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q.NORMALIZE = 1
+        self.c_k.NORMALIZE = 1
+        self.c_v.NORMALIZE = 1
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.NORMALIZE = 1
+        self.c_proj.NORM_FIRST = 1
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
 
@@ -192,12 +197,12 @@ class MLP(nn.Module):
         # uv projection
         self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
-        self.c_fc.WEIGHT_HIDDEN = 1
-        self.c_fc2.WEIGHT_HIDDEN = 1
+        self.c_fc.NORMALIZE = 1
+        self.c_fc2.NORMALIZE = 1
         # output projection
         self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
-        self.c_proj.RESIDUAL_SCALE_FLAG = 1
-        self.c_proj.WEIGHT_HIDDEN = 1
+        self.c_proj.NORMALIZE = 1
+        self.c_proj.NORM_FIRST = 1
 
     def forward(self, x):
         x1 = self.c_fc(x)
@@ -239,8 +244,13 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.transformer.wte.NORMALIZE = 1
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # no need for self.lm_head.NORMALIZE = 1 as its tied to transformer.wte
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        self.norm_weights()
 
     def forward(self, idx, targets=None, return_logits=True):
 
@@ -265,6 +275,15 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+    
+    @torch.no_grad()
+    def norm_weights(self):
+        for module in self.modules():
+            if hasattr(module, 'NORMALIZE'):
+                if hasattr(module, 'NORM_FIRST'): # W_o of SA and MLP
+                    module.weight.copy_(F.normalize(module.weight, dim=0))
+                else:
+                    module.weight.copy_(F.normalize(module.weight, dim=-1))
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -536,6 +555,8 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # normalize all the weights (step 2 of nGPT)
+    raw_model.norm_weights()
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
