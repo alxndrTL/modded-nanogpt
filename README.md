@@ -38,7 +38,8 @@ Notes about my experiments / potential things to look upon :
 - the slowdown incurred by nGPT over GPT is only about 20%, as opposed to 80% reported in the paper. Note that I used the latest `2.5` version of pytorch.
 - I used the WSD LR scheduler, as opposed to cosine scheduler in the paper.
 - the behavior of "nGPT catching up and beating GPT during the cooldown" is a bit weird, maybe try to make the slowdown longer ? (proposed by @Grad62304977)
-
+- train at ctx_len=256, and see if it can extrapolates to ctx_len=1024 ? it's easier to see than 1024/2048 for example (also proposed by @Grad62304977)
+- maybe try looking at the [EDM2 code](https://github.com/NVlabs/edm2/blob/main/training/networks_edm2.py) ? also by Nvidia, and shares similar ideas of heavy normalization.
 
 I used muP for both GPT and nGPT to fix the LR of `2**(-9)` thanks to a sweep at `n_embd=64`. I used it in a "non-invasive" way as I like to call it : at the desired width `n_embd=768` I fixed SP=muP. See [this](https://x.com/AlexandreTL2/status/1841056891801104472).
 
