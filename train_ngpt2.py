@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
+import math
 import tyro
 import wandb
 from dataclasses import dataclass
@@ -127,6 +128,14 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+class Scaler(nn.Module):
+    def __init__(self, dim, init, scale):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim) * scale)
+        self.forward_scale = init / scale
+    def forward(self):
+        return self.scale * self.forward_scale
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -217,11 +226,16 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
+        self.attn_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
+
         self.mlp = MLP(config)
+        self.mlp_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
 
     def forward(self, x):
-        x = x + self.attn(x)
-        x = x + self.mlp(x)
+        hA = F.normalize(self.attn(x), dim=-1)
+        x = F.normalize(x + self.attn_scaler() * (hA - x), dim=-1)
+        hM = F.normalize(self.mlp(x), dim=-1)
+        x = F.normalize(x + self.mlp_scaler() * (hM - x), dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
