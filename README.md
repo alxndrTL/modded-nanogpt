@@ -4,7 +4,7 @@ This repo is a fork of the [modded-nanogpt](https://github.com/KellerJordan/modd
 
 I used a smaller model than what is used in the paper (162M vs 0.5B and 1B) and far fewer tokens (2.5B vs 500B). But I guess we have to start somewhere to try and verify the results by ourselves.
 
-This is the validation loss curves for GPT and nGPT:
+This is the validation loss curves for GPT and nGPT, on 2.5B tokens on FineWeb:
 
 <div align="center">
 <img src="img/ngpt_val_loss_162M.png" alt="ngpt" style="width:80%;">
