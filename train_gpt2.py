@@ -7,6 +7,7 @@ import glob
 import time
 from dataclasses import dataclass
 
+import tyro
 import numpy as np
 import torch
 from torch import nn
@@ -348,7 +349,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
+args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
