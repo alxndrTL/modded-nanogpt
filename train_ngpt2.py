@@ -135,6 +135,36 @@ def get_scaler_parameters(model):
             scaler_params.append(module.scale)
     return scaler_params
 
+
+def get_transformer_params_without_scalers(transformer_blocks):
+    """
+    Collects 2D parameters from transformer blocks except Scaler parameters.
+    Only collects parameters from specific layer types that should use Muon optimization.
+    
+    Args:
+        transformer_blocks: nn.ModuleList of transformer blocks
+    Returns:
+        list of 2D parameters suitable for Muon optimizer
+    """
+    params = []
+    for block in transformer_blocks:
+        # We'll explicitly collect from specific layers we know should use Muon
+        # This is safer than trying to exclude specific types
+        
+        # Collect from attention layers
+        attn = block.attn
+        for param in [attn.c_q.weight, attn.c_k.weight, attn.c_v.weight, attn.c_proj.weight]:
+            if param.dim() == 2:  # Double-check dimensionality
+                params.append(param)
+        
+        # Collect from MLP layers
+        mlp = block.mlp
+        for param in [mlp.c_ufc.weight, mlp.c_vfc.weight, mlp.c_proj.weight]:
+            if param.dim() == 2:  # Double-check dimensionality
+                params.append(param)
+    
+    return params
+
 class Scaler(nn.Module):
     def __init__(self, dim, init, scale):
         super().__init__()
@@ -398,7 +428,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4578 # number of iterations to run
     warmup_iters : int = 0
@@ -408,7 +438,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = True
+    log_wandb : bool = False
 args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -465,11 +495,16 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
-optimizer3 = Muon(raw_model.transformer.h.parameters(),           lr=0.02,  momentum=0.95)
-optimizer4 = torch.optim.Adam([get_scaler_parameters(raw_model)], lr=0.02, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight],                  lr=0.3,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],                          lr=0.002, betas=(0.9, 0.95), fused=True)
+optimizer3 = Muon(get_transformer_params_without_scalers(raw_model.transformer.h), lr=0.02,  momentum=0.95)
+optimizer4 = torch.optim.Adam(get_scaler_parameters(raw_model),                    lr=0.02, betas=(0.9, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+if master_process:
+    print(f"Adam1 (Embedding)  : {sum(p.numel() for p in optimizer1.param_groups[0]['params']):,}")
+    print(f"Adam2 (LM Head)    : {sum(p.numel() for p in optimizer2.param_groups[0]['params']):,}")
+    print(f"Muon               : {sum(p.numel() for p in optimizer3.param_groups[0]['params']):,}")
+    print(f"Adam3 (Scalers)    : {sum(p.numel() for p in optimizer4.param_groups[0]['params']):,}")
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
