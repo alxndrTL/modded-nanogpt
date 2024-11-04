@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import wandb
 import tyro
 
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -123,6 +124,25 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+def get_scaler_parameters(model):
+    """
+    Collects all parameters from Scaler modules in the model.
+    Returns a list of parameters that can be passed to an optimizer.
+    """
+    scaler_params = []
+    for module in model.modules():
+        if isinstance(module, Scaler):
+            scaler_params.append(module.scale)
+    return scaler_params
+
+class Scaler(nn.Module):
+    def __init__(self, dim, init, scale):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim) * scale)
+        self.forward_scale = init / scale
+    def forward(self):
+        return self.scale * self.forward_scale
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -162,35 +182,58 @@ class CausalSelfAttention(nn.Module):
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # nGPT q,k scaler
+        self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=1/math.sqrt(config.n_embd))
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
+        # nGPT normalize tags
+        self.c_q.NORMALIZE = 1
+        self.c_k.NORMALIZE = 1
+        self.c_v.NORMALIZE = 1
+        self.c_proj.NORMALIZE = 1
+        # todo later : normalize first for c_proj?
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        q = self.qk_scaler() * F.normalize(q, dim=-1) # todo later : use rms_norm as in modded-gpt??
+        k = self.qk_scaler() * F.normalize(k, dim=-1)
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=math.sqrt(self.head_dim))
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
-
+    
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+        d_ff = int((8/3) * config.n_embd)
+        self.n_embd = config.n_embd
+        # uv projection
+        self.c_ufc = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_vfc = nn.Linear(config.n_embd, d_ff, bias=False)
+        # uv scalers
+        self.u_scaler = Scaler(dim=d_ff, init=1, scale=1)
+        self.v_scaler = Scaler(dim=d_ff, init=1, scale=1)
+        # output projection
+        self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        # nGPT normalize tags
+        self.c_ufc.NORMALIZE = 1
+        self.c_vfc.NORMALIZE = 1
+        self.c_proj.NORMALIZE = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x1 = self.u_scaler() * self.c_ufc(x)
+        x2 = math.sqrt(self.n_embd) * self.v_scaler() * self.c_vfc(x)
+        x2 = F.silu(x2)
+        x = x1 * x2
         x = self.c_proj(x)
         return x
 
@@ -200,10 +243,15 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
+        # nGPT scalers
+        self.attn_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
+        self.mlp_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
 
     def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        hA = F.normalize(self.attn(x), dim=-1)
+        x = F.normalize(x + self.attn_scaler() * (hA - x), dim=-1)
+        hM = F.normalize(self.mlp(x), dim=-1)
+        x = F.normalize(x + self.mlp_scaler() * (hM - x), dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
@@ -226,26 +274,30 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=1/math.sqrt(config.n_embd))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
+        # nGPT normalize tags
+        self.transformer.wte.NORMALIZE = 1
+        self.lm_head.NORMALIZE = 1
+
+        self.norm_weights()
 
     def forward(self, idx, targets=None, return_logits=True):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         for block in self.transformer.h:
             x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.logits_scaler() * self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.logits_scaler() * self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             logits = logits.float() # use tf32/fp32 for logits
             loss = None
 
@@ -254,6 +306,12 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+    
+    @torch.no_grad()
+    def norm_weights(self):
+        for module in self.modules():
+            if hasattr(module, 'NORMALIZE'):
+                module.weight.copy_(F.normalize(module.weight, dim=-1))
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -389,6 +447,8 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
+if master_process:
+    print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -408,7 +468,8 @@ enable_math_sdp(False)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
 optimizer3 = Muon(raw_model.transformer.h.parameters(),           lr=0.02,  momentum=0.95)
-optimizers = [optimizer1, optimizer2, optimizer3]
+optimizer4 = torch.optim.Adam([get_scaler_parameters(raw_model)], lr=0.02, betas=(0.9, 0.95), fused=True)
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -529,6 +590,8 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # nGPT weight norm
+    raw_model.norm_weights()
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
