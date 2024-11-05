@@ -349,7 +349,7 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
     log_wandb : bool = True
 args = tyro.cli(Hyperparameters)
 
@@ -364,7 +364,7 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-if args.log_wandb:
+if master_process and args.log_wandb:
     wandb.init(project="modded_gpt-muon", config={**vars(args)})
 
 # convenience variables

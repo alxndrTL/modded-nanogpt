@@ -427,6 +427,7 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
+    learning_rate : float = 0.02
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
@@ -437,8 +438,8 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
+    log_wandb : bool = True
 args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -452,7 +453,7 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-if args.log_wandb:
+if master_process and args.log_wandb:
     wandb.init(project="modded_gpt-muon", config={**vars(args)})
 
 # convenience variables
@@ -497,8 +498,8 @@ enable_math_sdp(False)
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight],                  lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],                          lr=0.002, betas=(0.9, 0.95), fused=True)
-optimizer3 = Muon(get_transformer_params_without_scalers(raw_model.transformer.h), lr=0.02,  momentum=0.95)
-optimizer4 = torch.optim.Adam(get_scaler_parameters(raw_model),                    lr=0.02, betas=(0.9, 0.95), fused=True)
+optimizer3 = Muon(get_transformer_params_without_scalers(raw_model.transformer.h), lr=args.learning_rate,  momentum=0.95)
+optimizer4 = torch.optim.Adam(get_scaler_parameters(raw_model),                    lr=args.learning_rate, betas=(0.9, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 if master_process:
     print(f"Adam1 (Embedding)  : {sum(p.numel() for p in optimizer1.param_groups[0]['params']):,}")
