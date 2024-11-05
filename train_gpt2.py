@@ -317,7 +317,7 @@ def get_lr(it):
     else:
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
-schedulers = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
 # begin logging
 if master_process:
@@ -340,6 +340,7 @@ if master_process:
         f.write('='*100 + '\n')
 
 training_time_ms = 0
+tokens_processed = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -419,11 +420,11 @@ for step in range(args.num_iterations + 1):
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
+    optimizer.step()
+    scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    tokens_processed += args.sequence_length * args.batch_size
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -434,7 +435,10 @@ for step in range(args.num_iterations + 1):
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         if args.log_wandb and (step%12==0):
-            wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
+            wandb.log({"train_loss": train_loss.item(),
+                       "lr": optimizer.param_groups[0]['lr'],
+                       "step_avg_ms": approx_time/timed_steps,
+                       "tokens_processed": tokens_processed}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
