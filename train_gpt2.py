@@ -341,6 +341,7 @@ if master_process:
 
 training_time_ms = 0
 tokens_processed = 0
+min_val_loss = float('inf')
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -429,6 +430,9 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    current_train_loss = train_loss.item()
+    min_train_loss = min(min_train_loss, current_train_loss)
+    loss_ratio = current_train_loss / min_train_loss if min_train_loss != float('inf') else 1.0
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
@@ -438,7 +442,8 @@ for step in range(args.num_iterations + 1):
             wandb.log({"train_loss": train_loss.item(),
                        "lr": optimizer.param_groups[0]['lr'],
                        "step_avg_ms": approx_time/timed_steps,
-                       "tokens_processed": tokens_processed}, step=step)
+                       "tokens_processed": tokens_processed,
+                       "train_loss_ratio": loss_ratio}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
