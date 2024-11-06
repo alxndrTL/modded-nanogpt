@@ -252,7 +252,7 @@ class Hyperparameters:
     # optimization hyperparams
     learning_rate : float = 0.0018 # lr
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4578 # number of iterations to run
     warmup_iters : int = 250
@@ -262,7 +262,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = True
+    log_wandb : bool = False
 args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -277,7 +277,7 @@ print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 if master_process and args.log_wandb:
-    wandb.init(project="modded_gpt-muon", config={**vars(args)})
+    wandb.init(project="slw", config={**vars(args)})
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -364,7 +364,7 @@ if master_process:
 
 training_time_ms = 0
 tokens_processed = 0
-min_val_loss = float('inf')
+min_train_loss = float('inf')
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
