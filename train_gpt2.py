@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+import dataclasses
 import wandb
 import tyro
 
@@ -298,7 +299,8 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768)
+model = GPT(gptconfig)
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -350,6 +352,14 @@ if master_process:
         import subprocess
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
+        f.write('='*100 + '\n')
+        # log hps and config
+        if args.log_wandb:
+            f.write(f"wandb run {wandb.run.name}\n")
+        f.write("Hyperparameters:\n")
+        f.write(f"{dataclasses.asdict(args)}\n")
+        f.write("Model config:\n")
+        f.write(f"{dataclasses.asdict(gptconfig)}\n")
         f.write('='*100 + '\n')
 
 training_time_ms = 0
