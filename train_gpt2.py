@@ -438,7 +438,7 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
-        if args.log_wandb and (step%12==0):
+        if args.log_wandb:
             wandb.log({"train_loss": train_loss.item(),
                        "lr": optimizer.param_groups[0]['lr'],
                        "step_avg_ms": approx_time/timed_steps,
