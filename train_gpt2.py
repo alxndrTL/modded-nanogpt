@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import wandb
 import tyro
 
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -124,6 +125,8 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        self.apply(self._init_weights)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, targets=None, return_logits=True):
@@ -151,6 +154,16 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            std = 0.02 if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -303,7 +316,7 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer = torch.optim.Adam(raw_model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), fused=True)
+optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -425,11 +438,11 @@ for step in range(args.num_iterations + 1):
     scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
-    tokens_processed += args.sequence_length * args.batch_size
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    tokens_processed += args.sequence_length * args.batch_size
     current_train_loss = train_loss.item()
     min_train_loss = min(min_train_loss, current_train_loss)
     loss_ratio = current_train_loss / min_train_loss if min_train_loss != float('inf') else 1.0
