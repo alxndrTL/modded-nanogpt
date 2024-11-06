@@ -250,7 +250,7 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    learning_rate : float = 0.0018 # lr
+    learning_rate : float = 0.0036 # lr
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
@@ -262,7 +262,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -428,11 +428,12 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
+    train_loss = 0.
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
+            train_loss += loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
@@ -453,16 +454,16 @@ for step in range(args.num_iterations + 1):
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     tokens_processed += args.sequence_length * args.batch_size
-    current_train_loss = train_loss.item()
+    current_train_loss = train_loss.item() / train_accumulation_steps
     min_train_loss = min(min_train_loss, current_train_loss)
     loss_ratio = current_train_loss / min_train_loss if min_train_loss != float('inf') else 1.0
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{current_train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{current_train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         if args.log_wandb:
-            wandb.log({"train_loss": train_loss.item(),
+            wandb.log({"train_loss": current_train_loss,
                        "lr": optimizer.param_groups[0]['lr'],
                        "step_avg_ms": approx_time/timed_steps,
                        "tokens_processed": tokens_processed,
