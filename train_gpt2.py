@@ -258,6 +258,8 @@ class Hyperparameters:
     warmup_iters : int = 250
     warmdown_iters : int = 1000 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
+    slw_start : int = 8
+    slw_iterations : int = 1000 # put 0 here to disable SLW
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -333,6 +335,13 @@ def get_lr(it):
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+def get_seqlen(it):
+    if it < args.slw_iterations:
+        seqlen = args.slw_start + ((it)/args.slw_iterations) * (args.sequence_length - args.slw_start)
+    else:
+        seqlen = args.sequence_length
+    seqlen = int(seqlen)
+    return seqlen - seqlen%8
 
 # begin logging
 if master_process:
@@ -429,9 +438,15 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     train_loss = 0.
+    seqlen = get_seqlen(step)
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
+            print(x.shape)
+            print(y.shape)
+            x, y = x[:, :seqlen], y[:, :seqlen]
+            print(x.shape)
+            print(y.shape)
             _, loss = model(x, y, return_logits=False)
             train_loss += loss.detach()
         # advance the dataset for the next batch
