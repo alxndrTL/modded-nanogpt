@@ -130,7 +130,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, targets=None, return_logits=True):
+    def forward(self, idx, targets=None, seqlen=None, return_logits=True):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -143,6 +143,12 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
+
+            if seqlen is not None:
+                mask = torch.arange(idx.size(1), device=idx.device)[None, :] < seqlen
+                mask = mask.expand(targets.size())
+                targets = torch.where(mask, targets, torch.full_like(targets, -1))
+
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -250,11 +256,11 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    learning_rate : float = 0.0036 # lr
+    learning_rate : float = 0.0018 # lr
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 4578 # number of iterations to run
+    num_iterations : int = 5078 # number of iterations to run
     warmup_iters : int = 250
     warmdown_iters : int = 1000 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
@@ -442,12 +448,8 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            print(x.shape)
-            print(y.shape)
-            x, y = x[:, :seqlen], y[:, :seqlen]
-            print(x.shape)
-            print(y.shape)
-            _, loss = model(x, y, return_logits=False)
+            #x, y = x[:, :seqlen], y[:, :seqlen] # torch compile doesn't like :(
+            _, loss = model(x, y, seqlen, return_logits=False)
             train_loss += loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -468,7 +470,7 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    tokens_processed += args.sequence_length * args.batch_size
+    tokens_processed += seqlen * args.batch_size
     current_train_loss = train_loss.item() / train_accumulation_steps
     min_train_loss = min(min_train_loss, current_train_loss)
     loss_ratio = current_train_loss / min_train_loss if min_train_loss != float('inf') else 1.0
@@ -480,6 +482,7 @@ for step in range(args.num_iterations + 1):
         if args.log_wandb:
             wandb.log({"train_loss": current_train_loss,
                        "lr": optimizer.param_groups[0]['lr'],
+                       "seqlen": seqlen,
                        "step_avg_ms": approx_time/timed_steps,
                        "tokens_processed": tokens_processed,
                        "train_loss_ratio": loss_ratio}, step=step)
