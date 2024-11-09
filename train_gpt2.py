@@ -240,10 +240,10 @@ class DistributedDataLoader:
         B = self.B
         T = self.T
         seq_len = seq_len or T
-        buf = self.tokens[self.current_position : self.current_position+B*seq_len+1]
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, seq_len) # inputs
-        y = (buf[1:]).view(B, seq_len) # targets
+        x = (buf[:-1]).view(B, T)[:, :seq_len] # inputs
+        y = (buf[1:]).view(B, T)[:, :seq_len] # targets
         # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
