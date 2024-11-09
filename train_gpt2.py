@@ -19,27 +19,29 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+def rmsnorm(x0):
+    x = x0.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + torch.finfo(x0.dtype).eps)
+    return x.type_as(x0)
+
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
 
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, base=10000, max_seq_len=1024):
         super().__init__()
         self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+        t = torch.arange(max_seq_len).type_as(self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq)
+        self.register_buffer('cos_cached', freqs.cos().bfloat16(), persistent=False)
+        self.register_buffer('sin_cached', freqs.sin().bfloat16(), persistent=False)
 
     def forward(self, x):
         seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        return cos[None, :, None, :], sin[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4 # multihead attention
@@ -72,7 +74,7 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = rmsnorm(q), rmsnorm(k) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
@@ -101,8 +103,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.attn(rmsnorm(x))
+        x = x + self.mlp(rmsnorm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -134,10 +136,10 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x = rmsnorm(x) # @Grad62304977
         for block in self.transformer.h:
             x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
+        x = rmsnorm(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -234,13 +236,14 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
-    def next_batch(self):
+    def next_batch(self, seq_len=None):
         B = self.B
         T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        seq_len = seq_len or T
+        buf = self.tokens[self.current_position : self.current_position+B*seq_len+1]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
+        x = (buf[:-1]).view(B, seq_len) # inputs
+        y = (buf[1:]).view(B, seq_len) # targets
         # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
@@ -260,16 +263,16 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 5078 # number of iterations to run
+    num_iterations : int = 5578 # number of iterations to run
     warmup_iters : int = 250
     warmdown_iters : int = 1000 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
     slw_start : int = 8
-    slw_iterations : int = 1000 # put 0 here to disable SLW
+    slw_iterations : int = 4000 # put 0 here to disable SLW
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 1000 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 2000 # every how many steps to save the checkpoint? 0 for only at the end
     log_wandb : bool = True
 args = tyro.cli(Hyperparameters)
 
@@ -302,7 +305,7 @@ val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-x, y = train_loader.next_batch()
+x, y = train_loader.next_batch(seq_len=args.sequence_lenght if args.slw_iterations==0 else args.slw_start)
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -405,7 +408,7 @@ for step in range(args.num_iterations + 1):
         val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
+            x_val, y_val = val_loader.next_batch(args.sequence_length)
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
@@ -423,7 +426,7 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0 and step > 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
@@ -448,11 +451,10 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            #x, y = x[:, :seqlen], y[:, :seqlen] # torch compile doesn't like :(
             _, loss = model(x, y, seqlen, return_logits=False)
             train_loss += loss.detach()
         # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
+        x, y = train_loader.next_batch(seqlen)
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
