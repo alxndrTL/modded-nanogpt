@@ -15,9 +15,9 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 import torch._inductor.config as config
-from torch.nn.parallel import DistributedDataParallel as DDP
+
+torch.cuda.empty_cache()
 
 def rmsnorm(x0):
     x = x0.float()
@@ -278,14 +278,10 @@ args = tyro.cli(Hyperparameters)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
-dist.init_process_group(backend='nccl')
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
+device = f'cuda:0'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+master_process = True # this process will do logging, checkpointing etc.
 
 if master_process and args.log_wandb:
     wandb.init(project="slw", config={**vars(args)})
@@ -293,15 +289,15 @@ if master_process and args.log_wandb:
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
+assert args.val_tokens % (B * T * 1) == 0
+val_steps = args.val_tokens // (B * T * 1)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+assert args.batch_size % (B * 1) == 0
+train_accumulation_steps = args.batch_size // (B * 1)
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+train_loader = DistributedDataLoader(args.input_bin, B, T, 1, 1)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, 1, 1)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
@@ -315,10 +311,8 @@ model = GPT(gptconfig)
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
+raw_model = model
 model = torch.compile(model, dynamic=None)
-# here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
@@ -329,7 +323,7 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
+optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -413,7 +407,6 @@ for step in range(args.num_iterations + 1):
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
                 del loss
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
@@ -457,8 +450,7 @@ for step in range(args.num_iterations + 1):
         x, y = train_loader.next_batch(seqlen)
         # backward pass
         if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
+            loss.backward()
         else:
             loss.backward() # just sync on the last step
     for p in model.parameters():
@@ -491,7 +483,3 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-# -------------------------------------------------------------------------
-# clean up nice
-dist.destroy_process_group()
