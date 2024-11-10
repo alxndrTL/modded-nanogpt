@@ -183,8 +183,7 @@ def get_seqlen(it):
     return 1024
 
 def get_batch_size(it):
-    bsz = 1 * (it+1)
-    return min(int(bsz), 16)
+    return int(it*2)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -213,7 +212,7 @@ model = GPT(gptconfig).to("cuda")
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 #print("BEFORE TORCH COMPILE ------------------------------")
-model = torch.compile(model, dynamic=None)
+model = torch.compile(model, dynamic=False)
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
@@ -243,6 +242,7 @@ last_time = start_time
 
 for epoch in range(100):  # Nombre d'époques
     print(f"[{(time.time()-start_time):.4f}][{(time.time()-last_time):.4f}] epoch {epoch}, size: {get_seqlen(epoch)}")
+    #print(f"[{(time.time()-start_time):.4f}][{(time.time()-last_time):.4f}] epoch {epoch}, size: {get_batch_size(epoch)}")
     last_time = time.time()
 
     inputs = torch.randint(0, gptconfig.vocab_size, (16, get_seqlen(epoch),), device="cuda")

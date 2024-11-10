@@ -266,7 +266,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 2000 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = True
+    log_wandb : bool = False
 args = tyro.cli(Hyperparameters)
 
 if args.log_wandb:
