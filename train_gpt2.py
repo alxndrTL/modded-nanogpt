@@ -132,7 +132,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, targets=None, seqlen=None, return_logits=True):
+    def forward(self, idx, targets=None, return_logits=True):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -145,11 +145,6 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
-
-            if seqlen is not None:
-                mask = torch.arange(idx.size(1), device=idx.device)[None, :] < seqlen
-                mask = mask.expand(targets.size())
-                targets = torch.where(mask, targets, torch.full_like(targets, -1))
 
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
@@ -263,12 +258,12 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 5578 # number of iterations to run
+    num_iterations : int = 3178 # number of iterations to run
     warmup_iters : int = 250
-    warmdown_iters : int = 1000 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 600 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
     slw_start : int = 8
-    slw_iterations : int = 1000 # put 0 here to disable SLW
+    slw_iterations : int = 2500 # put 0 here to disable SLW
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -399,7 +394,7 @@ for step in range(args.num_iterations + 1):
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0 and step>0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
@@ -451,7 +446,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss = model(x, y, seqlen, return_logits=False)
+            _, loss = model(x, y, return_logits=False)
             train_loss += loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch(seqlen)
