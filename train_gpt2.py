@@ -211,11 +211,10 @@ class DifferentialCausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
         self.lambda_init = lambda_init_fn(depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.d_head, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.d_head, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.d_head, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.d_head, dtype=torch.float32).normal_(mean=0,std=0.1))
-        #self.subln = RMSNorm(dim=2*self.d_head, eps=1e-5, use_mup=False)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
 
     def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -230,17 +229,23 @@ class DifferentialCausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q = q.view(B, T, 2, self.n_head//2, self.head_dim)
         k = k.view(B, T, 2, self.n_head//2, self.head_dim)
-        q1, q2 = q[:, 0], q[:, 1] # (B, T, n_head, d_head) each
-        k1, k2 = k[:, 0], k[:, 1]
-        attn1 = F.scaled_dot_product_attention(q1.transpose(1, 2), k1.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        attn2 = F.scaled_dot_product_attention(q2.transpose(1, 2), k2.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        v = v.view(B, T, 2, self.n_head//2, self.head_dim)
+        q_1, q_2 = q[:, :, 0], q[:, :, 1] # (B, T, n_head, d_head) each
+        k_1, k_2 = k[:, :, 0], k[:, :, 1]
+        v_1, v_2 = v[:, :, 0], v[:, :, 1]
+        attn11 = F.scaled_dot_product_attention(q_1.transpose(1, 2), k_1.transpose(1, 2), v_1.transpose(1, 2), is_causal=True)
+        attn12 = F.scaled_dot_product_attention(q_1.transpose(1, 2), k_1.transpose(1, 2), v_2.transpose(1, 2), is_causal=True)
+        attn1 = torch.cat([attn11, attn12], dim=-1)
+        attn21 = F.scaled_dot_product_attention(q_2.transpose(1, 2), k_2.transpose(1, 2), v_1.transpose(1, 2), is_causal=True)
+        attn22 = F.scaled_dot_product_attention(q_2.transpose(1, 2), k_2.transpose(1, 2), v_2.transpose(1, 2), is_causal=True)
+        attn2 = torch.cat([attn21, attn22], dim=-1)
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
         y = attn1 - lambda_full * attn2
         y = F.rms_norm(y, (y.size(-1),))
         y = y * (1 - self.lambda_init)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.config.d_model)
+        y = y.transpose(1, 2).contiguous().view_as(x)
         y = self.c_proj(y)
         return y, v1
 
@@ -398,7 +403,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
@@ -408,7 +413,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -484,7 +489,7 @@ model = torch.compile(model)
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
-# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
+# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1#
 from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 enable_cudnn_sdp(True)
 enable_flash_sdp(False)
