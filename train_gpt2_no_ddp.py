@@ -252,21 +252,21 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    learning_rate : float = 0.0018 # lr
+    learning_rate : float = 0.0036 # lr
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3178 # number of iterations to run
+    num_iterations : int = 3578 # number of iterations to run
     warmup_iters : int = 250
-    warmdown_iters : int = 600 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 800 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
     slw_start : int = 8
-    slw_iterations : int = 2500 #2500 # put 0 here to disable SLW
+    slw_iterations : int = 1000 #2500 # put 0 here to disable SLW
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 2000 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = tyro.cli(Hyperparameters)
 
 if args.log_wandb:
