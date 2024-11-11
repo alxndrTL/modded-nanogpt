@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+import math
 import wandb
 
 import numpy as np
@@ -153,6 +154,15 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
+class Scaler(nn.Module):
+    def __init__(self, dim, init, scale):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim) * scale)
+        self.forward_scale = init / scale
+
+    def forward(self):
+        return self.scale * self.forward_scale
+
 class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -168,39 +178,56 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q.NORMALIZE = 1
+        self.c_k.NORMALIZE = 1
+        self.c_v.NORMALZE = 1
+        self.qk_scaler = Scaler(dim=self.head_dim, init=1, scale=1/math.sqrt(config.n_embd))
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.NORMALIZE = 1
+        self.c_proj.NORM_FIRST = 1
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x, v1=None):
+    def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-        if v1 is None:
-            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        q = self.qk_scaler() * F.normalize(q, dim=-1) # nGPT step 4
+        k = self.qk_scaler() * F.normalize(k, dim=-1)
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=math.sqrt(self.head_dim))
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y, v1
+        return y
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+        d_ff = int((8/3) * config.n_embd)
+        self.n_embd = config.n_embd
+
+        self.c_fc = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, d_ff, bias=False)
+        self.c_fc.NORMALIZE = 1
+        self.c_fc2.NORMALIZE = 1
+
+        self.u_scaler = Scaler(dim=d_ff, init=1, scale=1)
+        self.v_scaler = Scaler(dim=d_ff, init=1, scale=1)
+
+        self.c_proj = nn.Linear(d_ff, config.n_embd, bias=False)
+        self.c_proj.NORMALIZE = 1
+        self.c_proj.NORM_FIRST = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x1 = self.u_scaler() * self.c_fc(x) # nGPT step 5
+        x2 = math.sqrt(self.n_embd) * self.v_scaler() * self.c_fc2(x) # nGPT step 5
+        x2 = F.silu(x2)
+        x = x1 * x2
         x = self.c_proj(x)
         return x
 
@@ -209,15 +236,16 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
+        self.attn_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
         self.mlp = MLP(config)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.mlp_scaler = Scaler(dim=config.n_embd, init=1/config.n_layer, scale=1/math.sqrt(config.n_embd))
 
-    def forward(self, x, v1, x0):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
-        x = x + x1
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+    def forward(self, x):
+        hA = F.normalize(self.attn(x), dim=-1) # nGPT step 3
+        x = F.normalize(x + torch.abs(self.attn_scaler()) * (hA - x), dim=-1)
+        hM = F.normalize(self.mlp(x), dim=-1)
+        x = F.normalize(x + torch.abs(self.mlp_scaler()) * (hM - x), dim=-1)
+        return x
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -239,25 +267,36 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.transformer.wte.NORMALIZE = 1
+
+        self.logits_scaler = Scaler(dim=config.vocab_size, init=1, scale=1/math.sqrt(config.n_embd))
+
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.NORMALIZE = 1
         self.lm_head.weight.data.zero_() # @Grad62304977
+
+        self.norm_weights()
 
     def forward(self, idx, target):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
-        x0 = x
-        v1 = None
         for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
-        x = F.rms_norm(x, (x.size(-1),))
-
-        logits = self.lm_head(x)
+            x, = block(x)
+        logits = self.logits_scaler() * self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss.float()
+
+    @torch.no_grad()
+    def norm_weights(self):
+        for module in self.modules():
+            if hasattr(module, 'NORMALIZE'):
+                if hasattr(module, 'NORM_FIRST'): # W_o of SA and MLP
+                    module.weight.copy_(F.normalize(module.weight, dim=0))
+                else:
+                    module.weight.copy_(F.normalize(module.weight, dim=-1))
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -548,6 +587,7 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    raw_model.norm_weights() # nGPT step 2
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
