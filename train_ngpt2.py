@@ -20,6 +20,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+def justnorm(x):
+    res = x / x.norm(p=2, dim=-1, keepdim=True)
+    return res
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -52,6 +56,8 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
@@ -65,16 +71,28 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
 
+        self.sqk_init_value = 1.0       
+        self.sqk_init_scaling = config.base_scale
+        self.sqk = torch.nn.Parameter(self.sqk_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        q = q.transpose(2, 1)
+        k = k.transpose(2, 1)
+
+        sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
+        q = sqk * self.justnorm(q)
+        k = sqk * self.justnorm(k)
+        sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
+        softmax_scale = sqrt_head_dim
+        y = F.scaled_dot_product_attention(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), scale=softmax_scale, is_causal=True)
+        y = y.to(dtype=q.dtype)
+        y = y.contiguous().view(B, T, self.config.n_embd)
         y = self.c_proj(y)
         return y
 
@@ -82,27 +100,60 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.config = config
+
+        self.c_fc = nn.Linear(config.n_embd, 2*4*config.n_embd)
+        self.silu = nn.SiLU()
+        self.c_proj  = nn.Linear(4*config.n_embd, config.n_embd)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
+        self.suv_init_value = 1.0
+        self.suv_init_scaling = 1.0
+        self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 *4* config.n_embd, dtype=torch.float32))
+
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
+        uv = self.c_fc(x)
+        suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5)))
+        uv = suv * uv
+        u, v = torch.chunk(uv, 2, dim=-1)
+        x_mlp = u * self.silu(v)
+        h_mlp = self.c_proj(x_mlp)
+        return h_mlp
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
+
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
+        self.attn_alpha_init_value = 0.05
+        self.attn_alpha_init_scaling = config.base_scale
+        self.attn_alpha = torch.nn.Parameter(self.attn_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+
+        self.mlp_alpha_init_value = 0.05
+        self.mlp_alpha_init_scaling = config.base_scale
+        self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+
     def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        h_attn = self.attn(x)
+        lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
+        lr = torch.abs(lr)
+        A_norm = self.justnorm(x)
+        B_norm = self.justnorm(h_attn)    
+        res = A_norm + lr * (B_norm - A_norm)
+        x = self.justnorm(res)
+
+        h_mlp = self.mlp(x)
+        lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+        lr = torch.abs(lr)
+        A_norm = self.justnorm(x) # normally, normalization is not needed
+        B_norm = self.justnorm(h_mlp)       
+        res = A_norm + lr * (B_norm - A_norm)
+        x = self.justnorm(res)
         return x
 
 # -----------------------------------------------------------------------------
@@ -114,6 +165,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    base_scale : float = 1.0 / 768 ** 0.5
 
 class GPT(nn.Module):
 
@@ -130,16 +182,20 @@ class GPT(nn.Module):
 
         self.apply(self._init_weights)
 
+        self.sz_init_value = 1.00
+        self.sz_init_scaling = config.base_scale
+        self.sz = torch.nn.Parameter(self.sz_init_scaling*torch.ones(config.vocab_size, dtype=torch.float32))
+
     def forward(self, idx, targets=None):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),))
         for block in self.transformer.h:
             x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
+        sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
+        logits = sz * logits
         logits = logits.float() # use tf32/fp32 for logits
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
@@ -148,7 +204,7 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             # apply special scaled init to the residual projections, per GPT-2 paper
-            std = 0.02 if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            std = self.config.base_scale if not hasattr(module, 'RESIDUAL_SCALE_FLAG') else self.config.base_scale/math.sqrt(2 * self.config.n_layer)
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -229,6 +285,29 @@ class DistributedDataLoader:
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
         return x.cuda(), y.cuda()
+    
+# -----------------------------------------------------------------------------
+# nGPT helpers
+def justnorm(x, idim=-1):
+    dtype = x.dtype
+    x = x.float()
+    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
+    return res
+
+def normalize_matrices(transformer, module):
+    transformer.wte.weight.data.copy_(justnorm(transformer.wte.weight.data, 1))         # V, n_embd
+    module.lm_head.weight.data.copy_(justnorm(module.lm_head.weight.data, 1))           # V, n_embd
+    
+    for layer_idx in range(0, config.n_layer):
+        block = transformer["h"][layer_idx]
+
+        block.attn.c_q.weight.data.copy_(justnorm(block.c_q.weight.data, 1))             # n_proj, n_embd
+        block.attn.c_k.weight.data.copy_(justnorm(block.c_k.weight.data, 1))                 # n_proj, n_embd
+        block.attn.c_v.weight.data.copy_(justnorm(block.c_v.weight.data, 1))             # n_proj, n_embd
+        block.attn.c_proj.weight.data.copy_(justnorm(block.att_c_proj.weight.data, 0))   # n_embd, n_proj
+
+        block.mlp.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))               # n_proj, n_embd
+        block.mlp.c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))   # n_embd, n_proj
 
 # -----------------------------------------------------------------------------
 # int main
@@ -342,6 +421,9 @@ if master_process:
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
 
+# start by normalizing the weights
+normalize_matrices(model.module.transformer, model.module)
+
 training_time_ms = 0
 tokens_processed = 0
 # start the clock
@@ -427,6 +509,7 @@ for step in range(args.num_iterations + 1):
     scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    normalize_matrices(model.module.transformer, model.module)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
