@@ -1,0 +1,1 @@
+python data/cached_fineweb10B.py 20
