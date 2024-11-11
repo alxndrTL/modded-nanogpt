@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+import wandb
 
 import numpy as np
 import torch
@@ -353,6 +354,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    log_wandb : bool = False
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -366,10 +368,13 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
+if master_process and args.log_wandb:
+    wandb.init(project="difft", config={**vars(args)})
+
 # begin logging
 logfile = None
 if master_process:
-    run_id = str(uuid.uuid4())
+    run_id = wandb.run.name if args.log_wandb else str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
@@ -458,6 +463,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 
 # Start training loop
 training_time_ms = 0
+tokens_processed = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -490,6 +496,8 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if master_process and args.log_wandb:
+            wandb.log({"val_loss": val_loss}, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -541,8 +549,14 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    tokens_processed += args.sequence_length * args.batch_size
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    if master_process and args.log_wandb:
+            wandb.log({"train_loss": train_loss.item(),
+                       "lr": optimizers[2].param_groups[0]['lr'],
+                       "step_avg_ms": approx_time/timed_steps,
+                       "tokens_processed": tokens_processed}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
