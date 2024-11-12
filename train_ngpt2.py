@@ -117,8 +117,7 @@ class CausalSelfAttention(nn.Module):
         k = sqk * self.justnorm(k)
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
         softmax_scale = sqrt_head_dim
-        y = F.scaled_dot_product_attention(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), scale=softmax_scale, is_causal=True)
-        y = y.to(dtype=q.dtype)
+        y = F.scaled_dot_product_attention(q, k, v, scale=softmax_scale, is_causal=True)
         y = y.contiguous().view(B, T, self.config.n_embd)
         y = self.c_proj(y)
         return y
