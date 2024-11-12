@@ -52,6 +52,27 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
+def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
+    # Split the sinusoidal_pos into sin and cos parts
+    sin, cos = sinusoidal_pos.chunk(2, dim=-1)
+    # Apply the rotary embeddings to the query and key
+    q_rot = torch.stack((-q[..., 1::2], q[..., ::2]), dim=-1)
+    k_rot = torch.stack((-k[..., 1::2], k[..., ::2]), dim=-1)
+    q_rot = torch.reshape(q_rot, q.shape[:-1] + (q.shape[-1]//2, 2)) * torch.stack((cos, sin), dim=-1)
+    k_rot = torch.reshape(k_rot, k.shape[:-1] + (k.shape[-1]//2, 2)) * torch.stack((cos, sin), dim=-1)
+    q_rot = torch.reshape(q_rot, q.shape)
+    k_rot = torch.reshape(k_rot, k.shape)
+    return q_rot, k_rot
+
+def get_sinusoidal_embeddings( n_positions, dim):
+    """Generate sinusoidal positional embeddings."""
+    position = torch.arange(n_positions, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+    sinusoidal_emb = torch.zeros((n_positions, dim))
+    sinusoidal_emb[:, 0::2] = torch.sin(position * div_term)
+    sinusoidal_emb[:, 1::2] = torch.cos(position * div_term)
+    return sinusoidal_emb
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -75,13 +96,19 @@ class CausalSelfAttention(nn.Module):
         self.sqk_init_scaling = config.base_scale
         self.sqk = torch.nn.Parameter(self.sqk_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
 
+    def justnorm(self, x):
+        #return F.normalize(x, p=2, dim=-1)
+        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        return res
+
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-        cos, sin = self.rotary(q)
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        
+        sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
+        q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
         q = q.transpose(2, 1)
         k = k.transpose(2, 1)
 
@@ -102,15 +129,15 @@ class MLP(nn.Module):
         super().__init__()
         self.config = config
 
-        self.c_fc = nn.Linear(config.n_embd, 2*4*config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 2*int((8/3)*config.n_embd))
         self.silu = nn.SiLU()
-        self.c_proj  = nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj  = nn.Linear(int((8/3)*config.n_embd), config.n_embd)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
         self.suv_init_value = 1.0
         self.suv_init_scaling = 1.0
-        self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 *4* config.n_embd, dtype=torch.float32))
+        self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(int(2 *8/3* config.n_embd), dtype=torch.float32))
 
     def forward(self, x):
         uv = self.c_fc(x)
@@ -142,18 +169,18 @@ class Block(nn.Module):
         h_attn = self.attn(x)
         lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
         lr = torch.abs(lr)
-        A_norm = self.justnorm(x)
-        B_norm = self.justnorm(h_attn)    
+        A_norm = justnorm(x)
+        B_norm = justnorm(h_attn)    
         res = A_norm + lr * (B_norm - A_norm)
-        x = self.justnorm(res)
+        x = justnorm(res)
 
         h_mlp = self.mlp(x)
         lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
         lr = torch.abs(lr)
-        A_norm = self.justnorm(x) # normally, normalization is not needed
-        B_norm = self.justnorm(h_mlp)       
+        A_norm = justnorm(x) # normally, normalization is not needed
+        B_norm = justnorm(h_mlp)       
         res = A_norm + lr * (B_norm - A_norm)
-        x = self.justnorm(res)
+        x = justnorm(res)
         return x
 
 # -----------------------------------------------------------------------------
@@ -294,20 +321,20 @@ def justnorm(x, idim=-1):
     res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
     return res
 
-def normalize_matrices(transformer, module):
+def normalize_matrices(transformer, module, gptconfig):
     transformer.wte.weight.data.copy_(justnorm(transformer.wte.weight.data, 1))         # V, n_embd
     module.lm_head.weight.data.copy_(justnorm(module.lm_head.weight.data, 1))           # V, n_embd
     
-    for layer_idx in range(0, config.n_layer):
+    for layer_idx in range(0, gptconfig.n_layer):
         block = transformer["h"][layer_idx]
 
-        block.attn.c_q.weight.data.copy_(justnorm(block.c_q.weight.data, 1))             # n_proj, n_embd
-        block.attn.c_k.weight.data.copy_(justnorm(block.c_k.weight.data, 1))                 # n_proj, n_embd
-        block.attn.c_v.weight.data.copy_(justnorm(block.c_v.weight.data, 1))             # n_proj, n_embd
-        block.attn.c_proj.weight.data.copy_(justnorm(block.att_c_proj.weight.data, 0))   # n_embd, n_proj
+        block.attn.c_q.weight.data.copy_(justnorm(block.attn.c_q.weight.data, 1))             # n_proj, n_embd
+        block.attn.c_k.weight.data.copy_(justnorm(block.attn.c_k.weight.data, 1))                 # n_proj, n_embd
+        block.attn.c_v.weight.data.copy_(justnorm(block.attn.c_v.weight.data, 1))             # n_proj, n_embd
+        block.attn.c_proj.weight.data.copy_(justnorm(block.attn.c_proj.weight.data, 0))   # n_embd, n_proj
 
-        block.mlp.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))               # n_proj, n_embd
-        block.mlp.c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))   # n_embd, n_proj
+        block.mlp.c_fc.weight.data.copy_(justnorm(block.mlp.c_fc.weight.data, 1))               # n_proj, n_embd
+        block.mlp.c_proj.weight.data.copy_(justnorm(block.mlp.c_proj.weight.data, 0))   # n_embd, n_proj
 
 # -----------------------------------------------------------------------------
 # int main
@@ -320,17 +347,17 @@ class Hyperparameters:
     # optimization hyperparams
     learning_rate : float = 0.0018
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 16 # batch size, in sequences, per device
+    device_batch_size : int = 8 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4578 # number of iterations to run
-    warmup_iters : int = 250
+    warmup_iters : int = 0
     warmdown_iters : int = 1308 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    weight_decay : float = 0.1
+    weight_decay : float = 0.
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -367,7 +394,8 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+gptconfig = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768)
+model = GPT(gptconfig)
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -425,7 +453,7 @@ if master_process:
         f.write('='*100 + '\n')
 
 # start by normalizing the weights
-normalize_matrices(model.module.transformer, model.module)
+normalize_matrices(model.module.transformer, model.module, gptconfig)
 
 training_time_ms = 0
 tokens_processed = 0
@@ -456,7 +484,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss = model(x_val, y_val, return_logits=False)
+                loss = model(x_val, y_val)
                 val_loss += loss.detach()
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -495,7 +523,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss = model(x, y, return_logits=False)
+            loss = model(x, y)
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -512,7 +540,7 @@ for step in range(args.num_iterations + 1):
     scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
-    normalize_matrices(model.module.transformer, model.module)
+    normalize_matrices(model.module.transformer, model.module, gptconfig)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
