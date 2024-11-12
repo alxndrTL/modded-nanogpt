@@ -257,19 +257,14 @@ enable_math_sdp(False)
 
 # init the optimizer
 optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
-# learning rate decay scheduler (linear warmup and warmdown)
+# learning rate decay scheduler (cosine)
 def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
+    if it > args.num_iterations:
+        return 0
+    decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return coeff
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
 # begin logging
