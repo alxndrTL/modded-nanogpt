@@ -82,14 +82,17 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+        self.silu    = nn.SiLU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        uv = self.c_fc(x)
+        u, v = torch.chunk(uv, 2, dim=-1)
+        x = u * self.silu(v)
         x = self.c_proj(x)
         return x
 
@@ -159,7 +162,7 @@ class GPT(nn.Module):
 # poor man's data loader
 dataset = "openwebtext"
 block_size = 1024
-batch_size = 16
+batch_size = 8
 
 if os.path.exists('./../../data'):
     data_dir = os.path.join('./../../data', dataset)
@@ -193,7 +196,7 @@ class Hyperparameters:
     # optimization hyperparams
     learning_rate : float = 0.0018
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 16 # batch size, in sequences, per device
+    device_batch_size : int = 8 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4578 # number of iterations to run
     warmup_iters : int = 250
