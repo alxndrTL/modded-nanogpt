@@ -83,9 +83,9 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
         self.silu    = nn.SiLU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
@@ -262,6 +262,8 @@ enable_math_sdp(False)
 optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
 # learning rate decay scheduler (cosine)
 def get_lr(it):
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
     if it > args.num_iterations:
         return 0
     decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)

@@ -89,7 +89,7 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        #self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
 
         self.sqk_init_value = 1.0       
@@ -128,15 +128,15 @@ class MLP(nn.Module):
         super().__init__()
         self.config = config
 
-        self.c_fc = nn.Linear(config.n_embd, 2*int((8/3)*config.n_embd))
+        self.c_fc = nn.Linear(config.n_embd, 2*4*config.n_embd, bias=False)
         self.silu = nn.SiLU()
-        self.c_proj  = nn.Linear(int((8/3)*config.n_embd), config.n_embd)
+        self.c_proj  = nn.Linear(4*config.n_embd, config.n_embd, bias=False)
         self.c_proj.RESIDUAL_SCALE_FLAG = 1
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        #self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
         self.suv_init_value = 1.0
         self.suv_init_scaling = 1.0
-        self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(int(2 *8/3* config.n_embd), dtype=torch.float32))
+        self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(int(2 * 4 * config.n_embd), dtype=torch.float32))
 
     def forward(self, x):
         uv = self.c_fc(x)
@@ -204,7 +204,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.weight.data.zero_()
+        #self.lm_head.weight.data.zero_()
 
         self.apply(self._init_weights)
 
@@ -238,79 +238,31 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 # -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
+# poor man's data loader
+dataset = "openwebtext"
+block_size = 1024
+batch_size = 8
 
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-        exit(1)
-    assert header[1] == 1, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
+if os.path.exists('./../../data'):
+    data_dir = os.path.join('./../../data', dataset)
+else:   
+    data_dir = os.path.join('data', dataset)
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
-
-class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += int(shard_ntok)
-        self.ntok_total = ntok_total
-
-        # kick things off
-        self.reset()
-
-    def reset(self):
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x.cuda(), y.cuda()
+def get_batch(split):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+    x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    return x, y
     
 # -----------------------------------------------------------------------------
 # nGPT helpers
@@ -348,7 +300,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 8 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 4578 # number of iterations to run
+    num_iterations : int = 4000 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 1308 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.
@@ -371,7 +323,7 @@ print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 if master_process and args.log_wandb:
-    wandb.init(project="ngpt-new2", config={**vars(args)})
+    wandb.init(project="ngpt-owt", config={**vars(args)})
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -383,12 +335,7 @@ assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-x, y = train_loader.next_batch()
+x, y = get_batch('train')
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -416,19 +363,16 @@ enable_math_sdp(False)
 
 # init the optimizer
 optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
-# learning rate decay scheduler (linear warmup and warmdown)
+# learning rate decay scheduler (cosine)
 def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters:
         return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
+    if it > args.num_iterations:
+        return 0
+    decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return coeff
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
 # begin logging
@@ -460,7 +404,6 @@ tokens_processed = 0
 torch.cuda.synchronize()
 t0 = time.time()
 # begin training
-train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -478,10 +421,9 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval()
-        val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
+            x_val, y_val = get_batch('val')
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 loss = model(x_val, y_val)
                 val_loss += loss.detach()
@@ -494,7 +436,7 @@ for step in range(args.num_iterations + 1):
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
             if args.log_wandb:
-                wandb.log({"val_loss": val_loss}, step=step)
+                wandb.log({"val/loss": val_loss, "iter": step}, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -525,7 +467,7 @@ for step in range(args.num_iterations + 1):
             loss = model(x, y)
             train_loss = loss.detach()
         # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
+        x, y = get_batch('train')
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
@@ -551,10 +493,9 @@ for step in range(args.num_iterations + 1):
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         if args.log_wandb:
             tokens_processed += args.sequence_length * args.batch_size
-            wandb.log({"train_loss": train_loss.item(),
+            wandb.log({"train/loss": train_loss.item(),
                        "lr": optimizer.param_groups[0]['lr'],
-                       "step_avg_ms": approx_time/timed_steps,
-                       "tokens_processed": tokens_processed}, step=step)
+                       "iter": step}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
