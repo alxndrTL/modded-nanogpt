@@ -48,6 +48,28 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
+class Pinard(nn.Module):
+
+    def __init__(self, in_features, out_features, N, config):
+        super().__init__()
+
+        self.k = nn.Parameter(torch.randn((N, in_features)))
+        self.v = nn.Parameter(torch.randn((N, out_features)))
+
+        torch.nn.init.normal_(self.k, mean=0., std=0.02)
+        torch.nn.init.normal_(self.v, mean=0., std=2/config.n_layer/math.sqrt(config.n_embd))
+
+    def _norm_scores(self, scores):
+        norm_outputs = scores / torch.norm(scores, p=2, dim=-1, keepdim=True) * math.sqrt(scores.shape[-1])
+        return F.gelu(norm_outputs)
+
+    def forward(self, q):
+        # same shapes and overall computations as standard attention with T=1 or N, n_head=1, head_dim=d1 or d2
+        # q: (B, T, n_head, head_dim) = (B, 1, 1, d1) = (B, d1), k: (T, 1, d1), v: (T, 1, d2)
+        scores = q @ self.k.T # (B, N)
+        out = self._norm_scores(scores) @ self.v # (B, d2)
+        return out
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -56,13 +78,14 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = Pinard(self.n_embd, self.n_embd, 576, config) # todo : create var
+        self.c_k = Pinard(self.n_embd, self.n_embd, 576, config)
+        self.c_v = Pinard(self.n_embd, self.n_embd, 576, config)
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.RESIDUAL_SCALE_FLAG = 1
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj = Pinard(self.n_embd, self.n_embd,self.n_embd, config)
+        #self.c_proj.RESIDUAL_SCALE_FLAG = 1
+        #self.c_proj.k.data.zero_() # zero init suggested by @Grad62304977
+        #self.c_proj.v.data.zero_()
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -78,27 +101,12 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.RESIDUAL_SCALE_FLAG = 1
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
-
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        self.mlp = Pinard(config.n_embd, config.n_embd, 2304, config)
 
     def forward(self, x):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
