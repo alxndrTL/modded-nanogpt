@@ -274,7 +274,7 @@ print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 if master_process and args.log_wandb:
-    wandb.init(project="ngpt-new2", config={**vars(args)})
+    wandb.init(project="tokenformer", config={**vars(args)})
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
