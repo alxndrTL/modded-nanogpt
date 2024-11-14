@@ -78,11 +78,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = Pinard(self.n_embd, self.n_embd, 576, config) # todo : create var
-        self.c_k = Pinard(self.n_embd, self.n_embd, 576, config)
-        self.c_v = Pinard(self.n_embd, self.n_embd, 576, config)
+        self.c_q = Pinard(self.n_embd, self.n_embd, 768//2, config) # todo : create var
+        self.c_k = Pinard(self.n_embd, self.n_embd, 768//2, config)
+        self.c_v = Pinard(self.n_embd, self.n_embd, 768//2, config)
         # output projection
-        self.c_proj = Pinard(self.n_embd, self.n_embd, 576, config)
+        self.c_proj = Pinard(self.n_embd, self.n_embd, 768//2, config)
         #self.c_proj.RESIDUAL_SCALE_FLAG = 1
         #self.c_proj.k.data.zero_() # zero init suggested by @Grad62304977
         #self.c_proj.v.data.zero_()
@@ -100,13 +100,26 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
+    
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = Pinard(config.n_embd, 4 * config.n_embd, int(0.8 * config.n_embd), config)
+        self.c_proj  = Pinard(4 * config.n_embd, config.n_embd, int(0.8 * config.n_embd), config)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = Pinard(config.n_embd, config.n_embd, 2304, config)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
