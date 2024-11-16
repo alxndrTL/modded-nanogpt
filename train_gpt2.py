@@ -211,11 +211,12 @@ def _load_data_shard(filename):
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, B, T, skip_tokens, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
+        self.skip_tokens = skip_tokens
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
@@ -233,7 +234,7 @@ class DistributedDataLoader:
         self.reset()
 
     def reset(self):
-        self.current_shard = 0
+        self.current_shard = math.ceil(self.skip_tokens/100e6) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
@@ -263,6 +264,7 @@ class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    skip_tokens : int = 0
     # optimization hyperparams
     learning_rate : float = 0.0018
     batch_size : int = 8*64 # batch size, in sequences, across all devices
@@ -305,8 +307,8 @@ assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+train_loader = DistributedDataLoader(args.input_bin, B, T, args.skip_tokens, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, args.skip_tokens, ddp_rank, ddp_world_size)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
