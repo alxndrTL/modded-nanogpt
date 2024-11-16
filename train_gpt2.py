@@ -78,11 +78,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = Pinard(self.n_embd, self.n_embd, 576, config) # todo : create var
-        self.c_k = Pinard(self.n_embd, self.n_embd, 576, config)
-        self.c_v = Pinard(self.n_embd, self.n_embd, 576, config)
+        self.c_q = Pinard(self.n_embd, self.n_embd, config.n_param_attn, config) # todo : create var
+        self.c_k = Pinard(self.n_embd, self.n_embd, config.n_param_attn, config)
+        self.c_v = Pinard(self.n_embd, self.n_embd, config.n_param_attn, config)
         # output projection
-        self.c_proj = Pinard(self.n_embd, self.n_embd, 576, config)
+        self.c_proj = Pinard(self.n_embd, self.n_embd, config.n_param_attn, config)
         #self.c_proj.RESIDUAL_SCALE_FLAG = 1
         #self.c_proj.k.data.zero_() # zero init suggested by @Grad62304977
         #self.c_proj.v.data.zero_()
@@ -106,7 +106,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = Pinard(config.n_embd, config.n_embd, 2304, config)
+        self.mlp = Pinard(config.n_embd, config.n_embd, config.n_param_mlp, config)
 
     def forward(self, x):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
@@ -122,6 +122,8 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    n_param_attn : int = 576
+    n_param_mlp : int = 2304 
 
 class GPT(nn.Module):
 
