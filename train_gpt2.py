@@ -69,6 +69,21 @@ class Pinard(nn.Module):
         scores = q @ self.k.T # (B, N)
         out = self._norm_scores(scores) @ self.v # (B, d2)
         return out
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        for key in ['k', 'v']:
+            full_key = prefix + key
+            if full_key in state_dict:
+                param = state_dict[full_key]
+                curr_param = getattr(self, key)
+                curr_N = curr_param.size(0)
+                loaded_N = param.size(0)
+                assert loaded_N <= curr_N
+                new_param = torch.zeros_like(curr_param)
+                new_param[:loaded_N] = param[:loaded_N]
+                state_dict[full_key] = new_param
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
 class CausalSelfAttention(nn.Module):
 
@@ -257,10 +272,12 @@ class Hyperparameters:
     warmup_iters : int = 250
     warmdown_iters : int = 1308 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
+    # load/save
+    ckpt : str = ""
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     log_wandb : bool = True
 args = Hyperparameters()
 
@@ -298,8 +315,10 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768, n_param_attn=576, n_param_mlp=2304))
 model = model.cuda()
+if args.ckpt:
+    model.load_state_dict(torch.load(args.ckpt), strict=False)
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
