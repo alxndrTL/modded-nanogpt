@@ -169,5 +169,5 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=4, n_embd=128, n_param_attn=5120, n_param_mlp=20350))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768, n_param_attn=144, n_param_mlp=576))
 print(f"Model initialized. Number of parameters : {sum([p.numel()/1000000 for p in model.parameters()]):.2f}M.")

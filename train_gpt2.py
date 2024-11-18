@@ -60,7 +60,15 @@ class Pinard(nn.Module):
         torch.nn.init.normal_(self.v, mean=0., std=2/config.n_layer/math.sqrt(config.n_embd))
 
     def _norm_scores(self, scores):
-        norm_outputs = scores / torch.norm(scores, p=2, dim=-1, keepdim=True) * math.sqrt(scores.shape[-1])
+        #if scores.shape[-1]==96: # todo : move (or either train without tau)
+        #    tau = math.sqrt(96)
+        #elif scores.shape[-1]==384:
+        #    tau = math.sqrt(384)
+        #else:
+        #    raise NotImplementedError
+        tau = math.sqrt(scores.shape[-1])
+        
+        norm_outputs = scores / torch.norm(scores, p=2, dim=-1, keepdim=True) * tau
         return F.gelu(norm_outputs)
 
     def forward(self, q):
@@ -264,18 +272,19 @@ class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
-    skip_tokens : int = 0
+    skip_tokens : int = 2500000001
     # optimization hyperparams
     learning_rate : float = 0.0018
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4578 # number of iterations to run
-    warmup_iters : int = 250
-    warmdown_iters : int = 1308 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmup_iters : int = 0
+    warmdown_iters : int = 0 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0.1
     # load/save
-    ckpt : str = ""
+    ckpt : str = "logs/azure-morning-46/state_step000500.pt"
+    start_step : int = 500
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -320,7 +329,8 @@ num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768, n_param_attn=576, n_param_mlp=2304))
 model = model.cuda()
 if args.ckpt:
-    model.load_state_dict(torch.load(args.ckpt), strict=False)
+    #model.load_state_dict(torch.load(args.ckpt, weight_only=True), strict=False)
+    model.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in torch.load(args.ckpt, map_location='cuda:0', weights_only=True)['model'].items()}, strict=False)
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -341,6 +351,8 @@ enable_math_sdp(False)
 
 # init the optimizer
 optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=True)
+#if args.ckpt:
+#    optimizer.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in torch.load(args.ckpt, map_location='cuda:0', weights_only=True)['optimizers'].items()})
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -352,7 +364,7 @@ def get_lr(it):
         return 1.0
     # 3) linear warmdown
     else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        decay_ratio = (args.num_iterations - it) / args.warmdown_iters if args.warmdown_iters>0 else 1.0
         return decay_ratio
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
@@ -383,7 +395,7 @@ torch.cuda.synchronize()
 t0 = time.time()
 # begin training
 train_loader.reset()
-for step in range(args.num_iterations + 1):
+for step in range(args.start_step, args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
