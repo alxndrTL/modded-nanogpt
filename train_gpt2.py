@@ -144,6 +144,7 @@ class Rotary(torch.nn.Module):
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4 # multihead attention
     d = x.shape[3]//2
+    cos, sin = cos[..., :d], sin[..., :d]
     x1 = x[..., :d]
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
@@ -161,6 +162,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.n_rot = (int(config.p_rope * self.head_dim)//2) * 2
         assert self.n_embd % self.n_head == 0
         self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
@@ -181,7 +183,9 @@ class CausalSelfAttention(nn.Module):
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q_rot, q_pass, k_rot, k_pass = q[..., :self.n_rot], q[..., self.n_rot:], k[..., :self.n_rot], k[..., self.n_rot:]
+        q_rot, k_rot = apply_rotary_emb(q_rot, cos, sin), apply_rotary_emb(k_rot, cos, sin)
+        q, k = torch.cat((q_rot, q_pass), dim=-1), torch.cat((k_rot, k_pass), dim=-1)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -225,6 +229,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    p_rope : float = 0.75
 
 class GPT(nn.Module):
 
@@ -361,7 +366,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3000 # number of iterations to run
     warmup_iters : int = 0
@@ -371,7 +376,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -408,7 +413,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768, p_rope=0.75))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
