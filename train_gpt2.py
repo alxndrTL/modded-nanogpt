@@ -379,6 +379,14 @@ class Hyperparameters:
     log_wandb : bool = True
 args = Hyperparameters()
 
+# reproducibility
+seed = 123456789
+torch.manual_seed(seed)
+np.random.seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
 dist.init_process_group(backend='nccl')
