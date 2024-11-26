@@ -239,6 +239,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    n_memory_tokens : int = 128
 
 class GPT(nn.Module):
 
@@ -258,6 +259,10 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
+        self.n_memory_tokens = config.n_memory_tokens
+        if self.n_memory_tokens > 0:
+            self.memory_tokens = nn.Parameter(torch.randn(self.n_memory_tokens, config.n_embd))
+
     def forward(self, idx, target, attn_blocksize):
 
         docs = (idx == 50256).cumsum(0)
@@ -265,13 +270,23 @@ class GPT(nn.Module):
           causal_mask = q_idx >= kv_idx
           document_mask = docs[q_idx] == docs[kv_idx]
           window_mask = q_idx - kv_idx < attn_blocksize
-          return causal_mask & document_mask & window_mask
-
+          metatokens_mask = kv_idx < self.n_memory_tokens
+          return (causal_mask & document_mask & window_mask) | metatokens_mask
+        
         S = len(idx)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
 
+        if self.n_memory_tokens > 0:
+            idx = idx[:-self.n_memory_tokens]
+            target = target[:-self.n_memory_tokens]
+
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
+
+        if self.n_memory_tokens > 0:
+            expanded_memory = self.memory_tokens.unsqueeze(0).expand(1, -1, -1)
+            x = torch.cat([expanded_memory, x], dim=1)
+
         x = norm(x) # @Grad62304977
         x0 = x
         v1 = None
@@ -286,6 +301,9 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
+
+        if self.n_memory_tokens > 0:
+            x = x[:, self.n_memory_tokens:]
 
         x = norm(x)
         logits = self.lm_head(x)
@@ -376,6 +394,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
+    n_memory_tokens : int = 128
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
@@ -384,7 +403,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -448,7 +467,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768, n_memory_tokens=args.n_memory_tokens))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -461,7 +480,7 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight, raw_model.memory_tokens], lr=0.6,   betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
