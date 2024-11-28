@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch._inductor.config as torch_ind_config
 
 from coord_check import get_coord_data, plot_coord_data
-from train_ngpt2 import GPT, GPTConfig
+from train_gpt2 import GPT, GPTConfig
 
 # --------------------------
 
@@ -66,9 +66,9 @@ class RandomDataset(Dataset):
         return x, y
 
 def lazy_model(width):
-    config = GPTConfig(vocab_size=max_value, n_layer=n_layers, n_head=width//d_head, n_embd=width)
-    if use_mup:
-        config.mup_width_mult = width / mup_base_width
+    config = GPTConfig(vocab_size=max_value, n_layer=n_layers, n_head=width//d_head, n_embd=width, n_embd_base=mup_base_width)
+    if not use_mup:
+        config.mup_width_mult = 1
     return GPT(config).to(device)
 
 models = {width: (lambda: lazy_model(width)) for width in widths}
@@ -85,8 +85,8 @@ else:
 df = get_coord_data(models, iter_, optcls, dtype_ctx, nsteps=10)
 
 if use_mup:
-    name = "ngpt_mup.png"
+    name = "gpt_mup.png"
 else:
-    name = "ngpt_no_mup.png"
+    name = "gpt_no_mup.png"
 
 plot_coord_data(df, legend="auto", save_to=os.path.join(output_dir, name))

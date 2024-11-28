@@ -110,11 +110,9 @@ def run_experiment(type_: Literal["SP", "μP"], width: int, lr: float) -> List[D
     elif type_ == "SP":
         use_mup = False
 
-    config = GPTConfig(vocab_size=vocab_size, n_layer=n_layers, n_head=width//d_head, n_embd=width)
+    config = GPTConfig(vocab_size=vocab_size, n_layer=n_layers, n_head=width//d_head, n_embd=width, n_embd_base=mup_base_width)
     if not use_mup:
         config.mup_width_mult = 1
-    else:
-        config.mup_width_mult = width / mup_base_width
 
     model = GPT(config).to(device)
     model = torch.compile(model)
