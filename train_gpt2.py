@@ -153,7 +153,7 @@ def apply_rotary_emb(x, cos, sin):
 class CastedLinear(nn.Linear):
     def __init__(self, config, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        bound = 1 / math.sqrt(config.mup_base_width * self.in_features)
+        bound = 1 / math.sqrt(config.mup_width_mult * self.in_features)
         torch.nn.init.uniform_(self.weight, -bound, bound)
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -166,11 +166,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = CastedLinear(config, self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(config, self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(config, self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = CastedLinear(config, self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
@@ -195,8 +195,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = CastedLinear(config, config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(config, 4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -227,8 +227,8 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 48
-    n_head : int = 25 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 1600
+    n_head : int = 1 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 64
     n_embd_base : int = 1600
 
     def __post_init__(self):
@@ -244,7 +244,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = CastedLinear(config, config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target):
@@ -345,8 +345,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/edu_fineweb100B/edu_fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/edu_fineweb100B/edu_fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/fineweb100B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb100B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*128 # batch size, in sequences, across all devices
     device_batch_size : int = 8 # batch size, in sequences, per device
@@ -397,6 +397,8 @@ if __name__ == "__main__":
     gptconfig = GPTConfig(vocab_size=num_vocab)
     model = GPT(gptconfig)
     model = model.cuda().bfloat16()
+    if master_process:
+        print(f"Model initialized. Number of parameters : {sum([p.numel() for p in model.parameters()])}.")
     for m in model.modules():
         if isinstance(m, CastedLinear):
             m.float()

@@ -1,1 +1,1 @@
-python data/cached_fineweb10B.py 20
+python data/cached_fineweb100B.py 20
