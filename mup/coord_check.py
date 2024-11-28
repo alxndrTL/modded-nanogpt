@@ -254,11 +254,11 @@ def _get_coord_data(models, dataloader, optcls, dtype_ctx, nsteps=5,
     for i in range(nseeds):
         torch.manual_seed(i)
         for width, model in models.items():
-            model = model()
+            model, config = model()
             model = model.train()
             if cuda:
                 model = model.cuda()
-            optimizer = optcls(model)
+            optimizers = optcls(model, config)
             for batch_idx, batch in enumerate(dataloader, 1):
                 remove_hooks = []
                 # add hooks
@@ -274,10 +274,11 @@ def _get_coord_data(models, dataloader, optcls, dtype_ctx, nsteps=5,
                     data, target = data.cuda(), target.cuda()
 
                     with dtype_ctx:
-                        _, loss = model(data, target, return_logits=False)
-                optimizer.zero_grad()
+                        loss = model(data, target)
+                model.zero_grad(set_to_none=True)
                 loss.backward()
-                optimizer.step()
+                for opt in optimizers:
+                    opt.step()
                 
                 # remove hooks
                 for handle in remove_hooks:
