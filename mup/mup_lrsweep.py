@@ -5,7 +5,11 @@ Adapted from the example in https://github.com/graphcore-research/unit-scaling.
 They use it to benchmark u-muP, a newer version of muP.
 """
 
+import sys
 import os
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(parent_dir)
+
 from typing import *
 from contextlib import nullcontext
 import random
@@ -17,20 +21,23 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
+import torch.distributed as dist
+dist.init_process_group(backend='nccl')
+
 import torch
 import torch.optim.lr_scheduler as lr_scheduler
 import torch._inductor.config as torch_ind_config
 
-from train_gpt2 import GPT, GPTConfig
+from train_gpt2 import GPT, GPTConfig, Muon
 
 # --------------------------
 
-filename = "gpt2_mup_fulltest.results.json"
-fig_name = "gpt2_mup_fulltest.png"
+filename = "gpt2_mup.results.json"
+fig_name = "gpt2_mup.png"
 
 type_to_lr_range = {
-    #"SP": [2**n for n in range(-11, -7 + 1)],
-    "μP": [2**n for n in range(-15, -13 + 1)],
+    "SP": [2**n for n in range(-10, -8 + 1)],
+    #"μP": [2**n for n in range(-15, -13 + 1)],
 }
 
 ctx_length = 256
@@ -45,9 +52,9 @@ batch_size = 128
 
 vocab_size = 256
 
-num_iters = 4000
-lr_warmup_iters = 200
-lr_warmdown_iters = 800
+num_iters = 3000
+lr_warmup_iters = 100
+lr_warmdown_iters = 0
 
 device = "cuda"
 dtype = "bfloat16"
@@ -118,12 +125,16 @@ def run_experiment(type_: Literal["SP", "μP"], width: int, lr: float) -> List[D
     model = torch.compile(model)
     model.train()
 
-    if not use_mup:
-        optim = model.configure_optimizer(learning_rate=lr, weight_decay=0., betas=(0.9, 0.95))
-    else:
-        optim = model.configure_optimizer_mup(learning_rate=lr, weight_decay=0., betas=(0.9, 0.95))
+    optimizer1 = torch.optim.Adam([model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
+    optimizer2 = torch.optim.Adam([model.lm_head.weight],         lr=0.001, betas=(0.9, 0.95), fused=True)
+    params = list(model.transformer.h.parameters())
+    matrix_params = [p for p in params if p.ndim == 2]
+    scalar_params = [p for p in params if p.ndim < 2]
+    optimizer3 = Muon(matrix_params,           lr=lr/config.mup_width_mult,  momentum=0.95)
+    optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+    optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
     
-    scheduler = lr_scheduler.LambdaLR(optim, wsd_schedule(warmup_iters=lr_warmup_iters, decay_iters=lr_warmdown_iters, num_iters=num_iters, start_iter=0))
+    schedulers = [lr_scheduler.LambdaLR(opt, wsd_schedule(warmup_iters=lr_warmup_iters, decay_iters=lr_warmdown_iters, num_iters=num_iters, start_iter=0)) for opt in optimizers]
 
     def run_step(batch):
         x = batch[:, :-1]
@@ -131,15 +142,21 @@ def run_experiment(type_: Literal["SP", "μP"], width: int, lr: float) -> List[D
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
         with dtype_ctx:
-            _, loss = model(x, y, return_logits=False)
+            loss = model(x, y)
 
         loss.backward()
 
         _ = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
 
-        optim.step()
-        scheduler.step()
-        optim.zero_grad()
+        # momentum warmup for Muon
+        frac = min(step/500, 1)
+        optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
         return loss
 
     log = []
@@ -180,3 +197,5 @@ for type_, ax in g.axes_dict.items():
     ax.set_xscale("log", base=2)
 
 g.savefig(fig_name, dpi=600)
+
+dist.destroy_process_group()
