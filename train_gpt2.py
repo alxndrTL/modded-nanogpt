@@ -7,6 +7,7 @@ import glob
 import time
 from dataclasses import dataclass
 
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -150,8 +151,10 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3).type_as(x)
 
 class CastedLinear(nn.Linear):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        bound = 1 / math.sqrt(config.mup_base_width * self.in_features)
+        torch.nn.init.uniform_(self.weight, -bound, bound)
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
 
@@ -226,6 +229,10 @@ class GPTConfig:
     n_layer : int = 48
     n_head : int = 25 # head dim 128 suggested by @Grad62304977
     n_embd : int = 1600
+    n_embd_base : int = 1600
+
+    def __post_init__(self):
+        self.mup_width_mult = self.n_embd / self.n_embd_base
 
 class GPT(nn.Module):
 
@@ -385,7 +392,8 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab))
+gptconfig = GPTConfig(vocab_size=num_vocab)
+model = GPT(gptconfig)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -411,7 +419,7 @@ params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
 optimizer3 = Muon(matrix_params,           lr=0.01,  momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.02/gptconfig.mup_width_mult, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
