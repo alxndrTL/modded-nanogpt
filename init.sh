@@ -1,4 +1,4 @@
-pip3 install --upgrade torch torchvision torchaudio
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
 
 pip install -r requirements.txt
 pip install wandb
