@@ -32,6 +32,7 @@ class DeMo(torch.optim.SGD):
     def __init__(
         self,
         params,
+        lr: float,
         compression_decay: float = 0.999,
         compression_topk: int = 32,
         compression_chunk: int = 64,
@@ -41,6 +42,7 @@ class DeMo(torch.optim.SGD):
     ):
         super().__init__(
             params,
+            lr=lr,
             foreach=False,
             momentum=0.0,
             dampening=0.0,
@@ -237,6 +239,8 @@ class TransformDCT:
             x = self.einsum_2d(x, n1w, n2w)
 
         else:  # 1D weights
+            print(self.shape_dict)
+            print(x.shape[0])
             n1 = self.shape_dict[x.shape[0]]
             n1w = self.f_dict[n1].to(x.device)
             self.f_dict[n1] = n1w
@@ -714,7 +718,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = True
+    log_wandb : bool = False
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -790,14 +794,7 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+optimizer = DeMo(raw_model.parameters(), lr=0.0018, compression_decay=0.999, compression_topk=32, compression_chunk=64, weight_decay=0.)
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -811,7 +808,7 @@ def get_lr(it):
     else:
         decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
 # Start training loop
 training_time_ms = 0
@@ -860,7 +857,7 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=optimizer.state_dict())
         torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
@@ -876,7 +873,7 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
-        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
+        ctx = model.no_sync()# if i < train_accumulation_steps else contextlib.nullcontext()
         with ctx: # there's no need to sync gradients every accumulation step
             # forward pass
             loss = model(x, y, attn_blocksize=attn_blocksize)
@@ -887,13 +884,9 @@ for step in range(args.num_iterations + 1):
         train_loss = loss.detach()
     for p in model.parameters():
         p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/300, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
+    optimizer.step()
+    scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
@@ -903,7 +896,7 @@ for step in range(args.num_iterations + 1):
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
     if args.log_wandb:
-        wandb.log({"train_loss": train_loss.item(), "lr": optimizers[2].param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
+        wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
