@@ -215,7 +215,7 @@ class TransformDCT:
             return torch.einsum("...ij, jb -> ...ib", x, b)
         else:
             # Note: b-c axis output is transposed to chunk DCT in 2D
-            return torch.einsum("...ijkl, jb, ld -> ...ikbd", x, b, d)
+            return torch.einsum("...ijkl, jb, ld -> ...ikbd", x.bfloat16(), b, d) # change n01
 
     @torch.no_grad()
     def einsum_2d_t(self, x, b, d=None):
@@ -239,8 +239,6 @@ class TransformDCT:
             x = self.einsum_2d(x, n1w, n2w)
 
         else:  # 1D weights
-            print(self.shape_dict)
-            print(x.shape[0])
             n1 = self.shape_dict[x.shape[0]]
             n1w = self.f_dict[n1].to(x.device)
             self.f_dict[n1] = n1w
@@ -303,7 +301,7 @@ class CompressDCT:
 
     @torch.no_grad()
     def decompress(self, p, idx, val, xshape, totalk):
-        x = torch.zeros(xshape, device=p.device, dtype=p.dtype)
+        x = torch.zeros(xshape, device=p.device, dtype=val.dtype) # change n02
 
         if len(xshape) > 2:  # 2D weights
             x = rearrange(x, "y x h w -> y x (h w)")
@@ -512,7 +510,7 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         # value residual lambda
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lamb = nn.Parameter(torch.tensor([0.5])) # @Grad62304977
         # rotary embeddings
         self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
@@ -527,7 +525,7 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_head, -1)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        v = (1 - self.lamb[0]) * v + self.lamb[0] * v1.view_as(v) # @Grad62304977 # TODO [0] not necessariy?
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, kernel_options={"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32}) # values by @normster
@@ -718,7 +716,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    log_wandb : bool = False
+    log_wandb : bool = True
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
