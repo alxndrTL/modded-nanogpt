@@ -792,7 +792,14 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer = DeMo(raw_model.parameters(), lr=0.0018, compression_decay=0.999, compression_topk=32, compression_chunk=64, weight_decay=0.)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+params = list(raw_model.transformer.h.parameters())
+matrix_params = [p for p in params if p.ndim == 2]
+scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+optimizer3 = DeMo(matrix_params, lr=0.0018, compression_decay=0.999, compression_topk=32, compression_chunk=64, weight_decay=0.)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -806,7 +813,7 @@ def get_lr(it):
     else:
         decay_ratio = (args.num_iterations - it) / args.cooldown_iters
         return decay_ratio
-scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # Start training loop
 training_time_ms = 0
@@ -855,7 +862,7 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=optimizer.state_dict())
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
         torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
@@ -871,7 +878,7 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
-        ctx = model.no_sync()# if i < train_accumulation_steps else contextlib.nullcontext()
+        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
         with ctx: # there's no need to sync gradients every accumulation step
             # forward pass
             loss = model(x, y, attn_blocksize=attn_blocksize)
@@ -883,8 +890,9 @@ for step in range(args.num_iterations + 1):
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
-    optimizer.step()
-    scheduler.step()
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
@@ -894,7 +902,7 @@ for step in range(args.num_iterations + 1):
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
     if args.log_wandb:
-        wandb.log({"train_loss": train_loss.item(), "lr": optimizer.param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
+        wandb.log({"train_loss": train_loss.item(), "lr": optimizers[2].param_groups[0]['lr'], "step_avg_ms": approx_time/timed_steps}, step=step)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
